@@ -129,14 +129,23 @@ def accuracy_PSNR(x, y, model):
         psnr = 20 * torch.log10(torch.tensor(max_val)) - 10 * torch.log10(mse)
     return psnr.detach().cpu().numpy()
 
-def save_epoch_stats(accuracies, save_path, prefix, iteration, SSIM=False):
-    df = pd.DataFrame({
-        'Epoch': np.arange(1, len(accuracies) + 1),
-        f'{prefix}_{"SSIM" if SSIM else "PSNR"}': accuracies
+def save_epoch_stats(accuracies, save_path, prefix, SSIM=False):
+    network_id = prefix
+    new_data = pd.DataFrame({
+        'Epoch': np.arange(1, n_epochs + 1),
+        f'{network_id}': accuracies
     })
-    filetype = 'SSIM' if SSIM else 'PSNR'
-    filename = f"{filetype}_{iteration}.csv"
-    df.to_csv(os.path.join(save_path, filename), index=False)
+
+    csv_path = os.path.join(save_path, f"SSIM.csv" if SSIM else f"PSNR.csv")
+
+    if os.path.exists(csv_path):
+        existing_df = pd.read_csv(csv_path)
+        combined_df = pd.merge(existing_df, new_data, on='Epoch', how='outer')
+    else:
+        combined_df = new_data
+
+    combined_df.to_csv(csv_path, index=False)
+
 
 def calculate_elbow_point(features, max_k=12, layer_name=""):
     unique_patterns = len(np.unique(features, axis=0))
@@ -154,10 +163,8 @@ def calculate_elbow_point(features, max_k=12, layer_name=""):
     for k in k_range:
         kmeans = KMeans(n_clusters=k, random_state=42, n_init=5)
         cluster_labels = kmeans.fit_predict(features)
-
         wcss = kmeans.inertia_
         wcss_values.append(wcss)
-
         print(f"k={k}: WCSS={wcss:.2f}")
 
     knee_locator = KneeLocator(k_range, wcss_values, curve='convex', direction='decreasing')
@@ -171,37 +178,36 @@ def calculate_elbow_point(features, max_k=12, layer_name=""):
 
     return optimal_k
 
-def visualize_cluster_representatives(features, cluster_labels, cluster_centers, layer_name, sidelength, save_dir, iteration, optimal_k):
-    plt.figure(figsize=(4 * optimal_k, 4))
+def visualize_cluster_representatives(features, cluster_labels, cluster_centers, layer_name, sidelength, col_num):
+    optimal_k = len(cluster_centers)
     for cluster_id in range(optimal_k):
         neurons_in_cluster = np.where(cluster_labels == cluster_id)[0]
-        if len(neurons_in_cluster) == 0:
-            continue
+        
+            
+        print(f"Cluster {cluster_id}: {len(neurons_in_cluster)} neurons - {neurons_in_cluster}")
         cluster_center = cluster_centers[cluster_id]
         neuron_distances = []
+
         for neuron_idx in neurons_in_cluster:
             neuron_pattern = features[:, neuron_idx]
             distance = np.linalg.norm(neuron_pattern - cluster_center)
             neuron_distances.append((neuron_idx, distance))
+
         neuron_distances.sort(key=lambda x: x[1])
         top = neuron_distances[0]
         neuron_2d = features[:, top[0]].reshape(sidelength, sidelength)
-        plt.subplot(1, optimal_k, cluster_id+1)
-        im = plt.imshow(neuron_2d, cmap='viridis')
-        plt.title(f'N {top[0]}, D {top[1]:.3f}', fontsize=12, pad=10)
-        plt.axis('off')
-        plt.colorbar(im, shrink=0.6)
-    plt.suptitle(f"{layer_name}: Cluster Representatives (k={optimal_k})", fontsize=14)
-    fname = f"{layer_name}_neuron_clustering_{iteration}.png"
-    plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, fname))
-    plt.close()
 
-def neuron_clustering_and_save(features, layer_name, sidelength, save_dir, iteration, max_k=12):
-    optimal_k = calculate_elbow_point(features, max_k=max_k, layer_name=layer_name)
-    kmeans = KMeans(n_clusters=optimal_k, random_state=42, n_init=5)
-    cluster_labels = kmeans.fit_predict(features.T)
-    visualize_cluster_representatives(features, cluster_labels, kmeans.cluster_centers_, layer_name, sidelength, save_dir, iteration, optimal_k)
+        ax = plt.subplot2grid((optimal_k, 6), (cluster_id, col_num-1), fig=plt.gcf())
+        im = ax.imshow(neuron_2d, cmap='viridis')
+        ax.set_title(f'N {top[0]}, D {top[1]:.3f}', fontsize=12, pad=10)
+        ax.axis('off')
+        plt.colorbar(im, ax=ax, shrink=0.6)
+
+def perform_neuron_clustering(features, layer_name, sidelength, col_num):
+    optimal_k = calculate_elbow_point(features.T, max_k=12, layer_name=f"{layer_name}_neurons")
+    kmeans_neurons = KMeans(n_clusters=optimal_k, random_state=42)
+    neuron_cluster_labels = kmeans_neurons.fit_predict(features.T)
+    visualize_cluster_representatives(features, neuron_cluster_labels, kmeans_neurons.cluster_centers_, layer_name, sidelength, col_num)
 
 ### TRAINING ###
 
@@ -245,9 +251,10 @@ for img_path in img_list:
                     accuracies.append(accuracy_PSNR(xy, img, model))
                     accuracies_SSIM.append(accuracy_SSIM(xy, img, model))
 
-                save_epoch_stats(accuracies, save_path1, "Network", iteration, SSIM=False)
-                save_epoch_stats(accuracies_SSIM, save_path1, "Network", iteration, SSIM=True)
+                save_epoch_stats(accuracies, save_path1, f"{iteration}", SSIM=False)
+                save_epoch_stats(accuracies_SSIM, save_path1, f"{iteration}", SSIM=True)
 
+                # Extract layer features
                 model.eval()
                 with torch.no_grad():
                     layer_features = {}
@@ -267,34 +274,59 @@ for img_path in img_list:
                     x = model.model[8](x)
                     x = model.model[9](x)
                     layer_features['layer_5'] = x.cpu().numpy()
-                
-                for layer_name, features in layer_features.items():
-                    neuron_clustering_and_save(
-                        features, 
-                        layer_name, 
-                        sidelength, 
-                        save_path_row, 
-                        iteration, 
-                        max_k=12
-                    )
 
-                dead_neurons = {}
-                for layer_name, features in layer_features.items():
+                # Generate prediction
+                model.eval()
+                with torch.no_grad():
+                    pred_colors = model(xy)
+                pred_img = pred_colors.view(sidelength, sidelength).cpu().numpy()
+
+                # Create visualization plots
+                plt.figure(figsize=(30, 20))
+                plt.subplot(1, 6, 1)
+                plt.imshow(pred_img, cmap='gray')
+                plt.title(f"Predicted Image from {iteration}\nPSNR: {accuracies[-1]:.6f}, SSIM: {accuracies_SSIM[-1]:.6f}")
+                plt.axis("off")
+
+                dead_neurons = 0
+                total_neurons = 0
+                dead_neurons_dict = {}
+
+                for idx, (layer_name, features) in enumerate(layer_features.items()):
+                    print(f"Processing {layer_name} with shape {features.shape}")
+
                     threshold = 0.5
                     completely_inactive_features = 0
                     num_features = features.shape[1]
+                    total_neurons += num_features
+
                     for feature_idx in range(num_features):
                         feature_map = features[:, feature_idx].reshape(sidelength, sidelength)
                         feature_normalized = (feature_map - feature_map.min()) / (feature_map.max() - feature_map.min() + 1e-8)
                         non_activated_pixels = np.sum(feature_normalized < threshold)
+
                         if non_activated_pixels == (sidelength * sidelength):
                             completely_inactive_features += 1
+                            dead_neurons += 1
+
                     inactive_features_percentage = (completely_inactive_features / num_features) * 100
-                    dead_neurons[f"{img_name}_L{layer_name.split('_')[-1]}"] = inactive_features_percentage
+                    dead_neurons_dict[f"{img_name}_L{layer_name.split('_')[-1]}"] = inactive_features_percentage
+
+                    plt.subplot(1, 6, idx + 2)
+                    plt.title(f'{layer_name.title()} - IF: {inactive_features_percentage:.1f}% (TH {threshold})', fontsize=14, pad=40)
+                    plt.axis('off')
+                    
+                    # Perform neuron clustering
+                    perform_neuron_clustering(features, layer_name, sidelength, idx + 2)
+
+                plt.subplots_adjust(left=0.03, right=0.97, top=0.75, hspace=0.3)
+                plt.savefig(os.path.join(save_path_row, f"neuron_clustering_{iteration}.png"), 
+                            bbox_inches='tight', facecolor='white', edgecolor='white', pad_inches=1.5)
+                plt.close()
 
                 psnr_val = np.mean(accuracies[-5:]) if len(accuracies) >= 5 else np.mean(accuracies)
                 ssim_val = np.mean(accuracies_SSIM[-5:]) if len(accuracies_SSIM) >= 5 else np.mean(accuracies_SSIM)
-                entry = Noisy(img_name, mu, pattern, iteration, psnr_val, ssim_val, dead_neurons)
+                entry = Noisy(img_name, mu, pattern, iteration, psnr_val, ssim_val, dead_neurons_dict)
                 all_stats.append(entry)
 
                 mid = time.time()
