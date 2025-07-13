@@ -2,19 +2,15 @@ import os, torch, time
 import numpy as np
 import torch.nn as nn
 import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-from math import e
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import Adam
 from sklearn.cluster import KMeans
 from skimage.metrics import structural_similarity as ssim
 from collections import defaultdict
-
-n_epochs = 100
-p_thresh = 22
-s_thresh = 0.7
+import matplotlib.pyplot as plt
+import seaborn as sns
+from kneed import KneeLocator
 
 class Noisy:
     def __init__(self, name, mu, pattern, iteration, psnr, ssim, dead):
@@ -60,14 +56,13 @@ def noise_function(mu, I, N):
     return noisy
 
 learning_rate = 1e-3
+n_epochs = 100
 layers = 5
 neurons = 256
 sidelength = 128
 activation_func = nn.ReLU()
-k = 5
 img_list = ["petal_1.png", "petal_2.png", "petal_3.png", "cameraman.png"]
 mu_list = [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
-
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(device)
@@ -134,6 +129,79 @@ def accuracy_PSNR(x, y, model):
         psnr = 20 * torch.log10(torch.tensor(max_val)) - 10 * torch.log10(mse)
     return psnr.detach().cpu().numpy()
 
+def save_epoch_stats(accuracies, save_path, prefix, iteration, SSIM=False):
+    df = pd.DataFrame({
+        'Epoch': np.arange(1, len(accuracies) + 1),
+        f'{prefix}_{"SSIM" if SSIM else "PSNR"}': accuracies
+    })
+    filetype = 'SSIM' if SSIM else 'PSNR'
+    filename = f"{filetype}_{iteration}.csv"
+    df.to_csv(os.path.join(save_path, filename), index=False)
+
+def calculate_elbow_point(features, max_k=12, layer_name=""):
+    unique_patterns = len(np.unique(features, axis=0))
+
+    if unique_patterns <= 1:
+        print(f"{layer_name}: Only 1 unique pattern, using k=1")
+        return 1
+
+    max_k = min(max_k, unique_patterns)
+    k_range = range(2, max_k + 1)
+    wcss_values = []
+
+    print(f"Calculating elbow point for {layer_name}...")
+
+    for k in k_range:
+        kmeans = KMeans(n_clusters=k, random_state=42, n_init=5)
+        cluster_labels = kmeans.fit_predict(features)
+
+        wcss = kmeans.inertia_
+        wcss_values.append(wcss)
+
+        print(f"k={k}: WCSS={wcss:.2f}")
+
+    knee_locator = KneeLocator(k_range, wcss_values, curve='convex', direction='decreasing')
+    optimal_k = knee_locator.knee
+
+    if optimal_k is None:
+        optimal_k = min(3, unique_patterns)
+        print(f"Elbow detection failed, using k={optimal_k}")
+    else:
+        print(f"Optimal k found: {optimal_k}")
+
+    return optimal_k
+
+def visualize_cluster_representatives(features, cluster_labels, cluster_centers, layer_name, sidelength, save_dir, iteration, optimal_k):
+    plt.figure(figsize=(4 * optimal_k, 4))
+    for cluster_id in range(optimal_k):
+        neurons_in_cluster = np.where(cluster_labels == cluster_id)[0]
+        if len(neurons_in_cluster) == 0:
+            continue
+        cluster_center = cluster_centers[cluster_id]
+        neuron_distances = []
+        for neuron_idx in neurons_in_cluster:
+            neuron_pattern = features[:, neuron_idx]
+            distance = np.linalg.norm(neuron_pattern - cluster_center)
+            neuron_distances.append((neuron_idx, distance))
+        neuron_distances.sort(key=lambda x: x[1])
+        top = neuron_distances[0]
+        neuron_2d = features[:, top[0]].reshape(sidelength, sidelength)
+        plt.subplot(1, optimal_k, cluster_id+1)
+        im = plt.imshow(neuron_2d, cmap='viridis')
+        plt.title(f'N {top[0]}, D {top[1]:.3f}', fontsize=12, pad=10)
+        plt.axis('off')
+        plt.colorbar(im, shrink=0.6)
+    plt.suptitle(f"{layer_name}: Cluster Representatives (k={optimal_k})", fontsize=14)
+    fname = f"{layer_name}_neuron_clustering_{iteration}.png"
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, fname))
+    plt.close()
+
+def neuron_clustering_and_save(features, layer_name, sidelength, save_dir, iteration, max_k=12):
+    optimal_k = calculate_elbow_point(features, max_k=max_k, layer_name=layer_name)
+    kmeans = KMeans(n_clusters=optimal_k, random_state=42, n_init=5)
+    cluster_labels = kmeans.fit_predict(features.T)
+    visualize_cluster_representatives(features, cluster_labels, kmeans.cluster_centers_, layer_name, sidelength, save_dir, iteration, optimal_k)
 
 ### TRAINING ###
 
@@ -147,7 +215,6 @@ for img_path in img_list:
     img = img.reshape(-1, 1).to(device)
 
     for mu in mu_list:
-        
         for pattern in range(10):
             img_noisy = noise_function(mu, img.clone(), torch.randn_like(img))
             img_noisy = img_noisy.reshape(-1, 1).to(device)
@@ -162,11 +229,9 @@ for img_path in img_list:
                 dataloader = DataLoader(dataset, batch_size=1024, shuffle=True)
 
                 save_path1 = f'noise_dead/{img_name}/{mu}/pattern{pattern}/PSNR'
-                save_path2 = f'noise_dead/{img_name}/{mu}/pattern{pattern}/IMG'
-                save_path3 = f'noise_dead/{img_name}/{mu}/pattern{pattern}/Feature-maps'
+                save_path_row = f'noise_dead/{img_name}/{mu}/pattern{pattern}/ROW'
                 os.makedirs(save_path1, exist_ok=True)
-                os.makedirs(save_path2, exist_ok=True)
-                os.makedirs(save_path3, exist_ok=True)
+                os.makedirs(save_path_row, exist_ok=True)
 
                 losses, accuracies, accuracies_SSIM = [], [], []
                 for epoch in range(n_epochs):
@@ -180,51 +245,8 @@ for img_path in img_list:
                     accuracies.append(accuracy_PSNR(xy, img, model))
                     accuracies_SSIM.append(accuracy_SSIM(xy, img, model))
 
-                epochs = np.arange(n_epochs) + 1
-                plt.figure(figsize=(30, 3))
-
-                plt.subplot(131)
-                plt.title(f'Training Loss over {n_epochs} epochs')
-                plt.plot(epochs, losses)
-                plt.xlabel('Epoch')
-                plt.ylabel('Loss')
-
-                plt.subplot(132)
-                plt.title(f'Training PSNR over {n_epochs} epochs')
-                plt.plot(epochs, accuracies)
-                plt.xlabel('Epoch')
-                plt.ylabel('PSNR')
-
-                plt.subplot(133)
-                plt.title(f'Training SSIM over {n_epochs} epochs')
-                plt.plot(epochs, accuracies_SSIM)
-                plt.xlabel('Epoch')
-                plt.ylabel('SSIM')
-
-                plt.tight_layout()
-                plt.savefig(os.path.join(save_path1, f"PSNR_{iteration}.png"))
-                plt.close()
-
-                model.eval()
-                with torch.no_grad():
-                    pred_colors = model(xy)
-                pred_img = pred_colors.view(sidelength, sidelength).cpu().numpy()
-                noisy_img = img_noisy.view(sidelength, sidelength).cpu().numpy()
-
-                plt.figure(figsize=(10, 5))
-                plt.subplot(1, 2, 1)
-                plt.imshow(noisy_img, cmap='gray')
-                plt.title(f"Noisy Input from {mu}")
-                plt.axis("off")
-                plt.subplot(1, 2, 2)
-                plt.imshow(pred_img, cmap='gray')
-                plt.title(f"Denoised Output from {mu}")
-                plt.axis("off")
-                plt.savefig(os.path.join(save_path2, f"img_{iteration}.png"))
-                plt.close()
-
-                cluster_maps = []
-                dead_neurons = {}
+                save_epoch_stats(accuracies, save_path1, "Network", iteration, SSIM=False)
+                save_epoch_stats(accuracies_SSIM, save_path1, "Network", iteration, SSIM=True)
 
                 model.eval()
                 with torch.no_grad():
@@ -245,66 +267,30 @@ for img_path in img_list:
                     x = model.model[8](x)
                     x = model.model[9](x)
                     layer_features['layer_5'] = x.cpu().numpy()
-
+                
                 for layer_name, features in layer_features.items():
-                    threshold = 0.2
-                    total_non_activated = 0
-                    completely_inactive_features = 0
-                    num_samples, num_features = features.shape
+                    neuron_clustering_and_save(
+                        features, 
+                        layer_name, 
+                        sidelength, 
+                        save_path_row, 
+                        iteration, 
+                        max_k=12
+                    )
 
+                dead_neurons = {}
+                for layer_name, features in layer_features.items():
+                    threshold = 0.5
+                    completely_inactive_features = 0
+                    num_features = features.shape[1]
                     for feature_idx in range(num_features):
                         feature_map = features[:, feature_idx].reshape(sidelength, sidelength)
                         feature_normalized = (feature_map - feature_map.min()) / (feature_map.max() - feature_map.min() + 1e-8)
                         non_activated_pixels = np.sum(feature_normalized < threshold)
-                        total_non_activated += non_activated_pixels
                         if non_activated_pixels == (sidelength * sidelength):
                             completely_inactive_features += 1
-
-                    total_pixels = num_features * sidelength * sidelength
                     inactive_features_percentage = (completely_inactive_features / num_features) * 100
-                    non_activated_percentage = (total_non_activated / total_pixels) * 100
                     dead_neurons[f"{img_name}_L{layer_name.split('_')[-1]}"] = inactive_features_percentage
-
-                    feature_maps = features.T.reshape(num_features, sidelength, sidelength)
-                    channels_per_plot = 20
-                    cols = 5
-                    rows = 4
-                    num_plots = (num_features + channels_per_plot - 1) // channels_per_plot
-
-                    for plot_num in range(num_plots):
-                        start_ch = plot_num * channels_per_plot
-                        end_ch = min(start_ch + channels_per_plot, num_features)
-                        plt.figure(figsize=(15, 12))
-                        plt.suptitle(f'{layer_name.title()}  - Plot{plot_num + 1} - Features {start_ch} to {end_ch-1}\nNon-activated: {non_activated_percentage:.1f}% | Inactive: {inactive_features_percentage:.1f}%')
-
-                        for idx, ch in enumerate(range(start_ch, end_ch)):
-                            plt.subplot(rows, cols, idx + 1)
-                            im = plt.imshow(feature_maps[ch], cmap='viridis')
-                            plt.title(f'Feature {ch}', fontsize=10)
-                            plt.colorbar(im, shrink=0.6)
-                            plt.axis('off')
-
-                        filename = f"{layer_name}_plot{plot_num + 1}_features_{start_ch}-{end_ch-1}_{iteration}.png"
-                        plt.savefig(os.path.join(save_path3, filename), dpi=150, bbox_inches='tight')
-                        plt.close()
-
-                    kmeans = KMeans(n_clusters=k, random_state=42)
-                    cluster_labels = kmeans.fit_predict(features)
-                    cluster_map = cluster_labels.reshape(sidelength, sidelength)
-                    cluster_maps.append((cluster_map, f'{layer_name} - K-means (k={k})'))
-
-                cols = 3
-                rows = int(np.ceil(len(cluster_maps) / cols))
-                plt.figure(figsize=(6 * cols, 5 * rows))
-                for i, (cluster_map, title) in enumerate(cluster_maps):
-                    plt.subplot(rows, cols, i + 1)
-                    im = plt.imshow(cluster_map, cmap='tab10')
-                    plt.title(title, fontsize=12)
-                    plt.axis("off")
-                    plt.colorbar(im, shrink=0.6)
-                plt.tight_layout()
-                plt.savefig(os.path.join(save_path3, f"cluster-maps_{iteration}.png"), dpi=150, bbox_inches='tight')
-                plt.close()
 
                 psnr_val = np.mean(accuracies[-5:]) if len(accuracies) >= 5 else np.mean(accuracies)
                 ssim_val = np.mean(accuracies_SSIM[-5:]) if len(accuracies_SSIM) >= 5 else np.mean(accuracies_SSIM)
@@ -360,16 +346,11 @@ df_avg = pd.DataFrame(avg_rows)
 df_avg = df_avg.sort_values(by=["image", "mu", "pattern"]).reset_index(drop=True)
 df_avg.to_csv("noise_dead/avg_dead.csv", index=False)
 
-
 ### HEATMAPS ###
-
-import seaborn as sns
-
 heatmap_path = "noise_dead/heatmaps"
 os.makedirs(heatmap_path, exist_ok=True)
 
 sns.set(style="whitegrid")
-
 layer_cols = ['L1', 'L2', 'L3', 'L4', 'L5']
 images = df_avg['image'].unique()
 
